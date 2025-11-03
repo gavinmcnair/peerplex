@@ -4,12 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
+	"math/rand"
 	"net"
 	"sync"
 	"time"
 )
 
-// Status represents peer liveness/health.
 type Status int
 
 const (
@@ -20,66 +21,88 @@ const (
 	StatusLeft
 )
 
-// MembershipEvent could be used for more complex status/event lifecycles.
-type MembershipEvent struct {
-	Type  Status
-	Peer  Peer
-	Extra map[string]string
-}
-
-// Membership is the primary membership API.
 type Membership interface {
 	Start(ctx context.Context) error
 	Stop() error
 	Self() Peer
 	Live() []Peer
-	All() map[PeerID]Peer
-	Status() map[PeerID]Status
 	GetPeer(id PeerID) (Peer, Status, bool)
+	Status() map[PeerID]Status
 	RegisterEventHandler(EventHandler)
 	Broadcast([]byte) error
 }
 
-type Option func(cfg *Config) error
-
-// -- MVP implementation below --
-
-type mvpMembership struct {
-	self    Peer
-	cfg     *Config
-	mu      sync.RWMutex
-	peers   map[PeerID]Peer
-	running bool
-
-	listener net.Listener
-	ctx      context.Context
-	cancel   context.CancelFunc
+type swimPeer struct {
+	Peer        Peer
+	Status      Status
+	Incarnation uint64
+	LastSeen    time.Time
+	SuspectAge  time.Time
 }
 
-func NewMembership(cfg *Config, opts ...Option) (Membership, error) {
+type swimChange struct {
+	ID          PeerID
+	Status      Status
+	Incarnation uint64
+}
+
+type swimMembership struct {
+	self           Peer
+	cfg            *Config
+	mu             sync.RWMutex
+	peers          map[PeerID]*swimPeer
+	incarnation    uint64
+	changes        []swimChange
+	eventHandlers  []EventHandler
+	listener       net.Listener
+	ctx            context.Context
+	cancel         context.CancelFunc
+	running        bool
+	wg             sync.WaitGroup
+	stopCh         chan struct{}
+	broadcastCh    chan []byte
+}
+
+// Network messages
+type swimMsg struct {
+	Type        string
+	Peer        Peer
+	Incarnation uint64
+	Changes     []swimChange
+	RelayTo     PeerID // for ping-req
+}
+
+func NewMembership(cfg *Config) (Membership, error) {
 	if cfg == nil {
 		return nil, errors.New("config required")
 	}
-	m := &mvpMembership{
+	inc := uint64(time.Now().UnixNano())
+	m := &swimMembership{
 		self: Peer{
 			ID:   PeerID(cfg.NodeID),
 			Addr: cfg.BindAddr,
 			Meta: cfg.Meta,
 		},
-		cfg:   cfg,
-		peers: make(map[PeerID]Peer),
+		cfg:           cfg,
+		peers:         make(map[PeerID]*swimPeer),
+		incarnation:   inc,
+		stopCh:        make(chan struct{}),
+		broadcastCh:   make(chan []byte, 128),
 	}
 	return m, nil
 }
 
-func (m *mvpMembership) Start(ctx context.Context) error {
+func (m *swimMembership) Start(ctx context.Context) error {
 	ctx2, cancel := context.WithCancel(ctx)
 	m.ctx = ctx2
 	m.cancel = cancel
 
-	m.mu.Lock()
-	m.peers[m.self.ID] = m.self
-	m.mu.Unlock()
+	m.peers[m.self.ID] = &swimPeer{
+		Peer:        m.self,
+		Status:      StatusAlive,
+		Incarnation: m.incarnation,
+		LastSeen:    time.Now(),
+	}
 
 	ln, err := net.Listen("tcp", m.self.Addr)
 	if err != nil {
@@ -88,186 +111,394 @@ func (m *mvpMembership) Start(ctx context.Context) error {
 	m.listener = ln
 	m.running = true
 
-	go m.acceptLoop() // Accept network joins/gossip
+	m.wg.Add(1)
+	go m.acceptLoop()
 
-	// Join seeds
 	for _, addr := range m.cfg.Seeds {
 		if addr == m.self.Addr || addr == "" {
 			continue
 		}
-		go m.sendJoin(addr)
+		go m.sendPing(addr, nil)
 	}
 
-	go m.gossipLoop()
+	m.wg.Add(1)
+	go m.tickLoop()
 
 	return nil
 }
 
-func (m *mvpMembership) Stop() error {
+func (m *swimMembership) Stop() error {
 	m.running = false
+	close(m.stopCh)
 	if m.cancel != nil {
 		m.cancel()
 	}
 	if m.listener != nil {
 		m.listener.Close()
 	}
+	m.wg.Wait()
 	return nil
 }
 
-// -- Network/gossip logic --
-
-type wireMsg struct {
-	Type  string // "join" or "peers"
-	Peer  Peer
-	Peers []Peer // for multi-peer exchange
+func (m *swimMembership) tickLoop() {
+	defer m.wg.Done()
+	t := time.NewTicker(m.cfg.GossipInterval)
+	defer t.Stop()
+	for m.running {
+		select {
+		case <-t.C:
+			m.swimProtocolRound()
+		case <-m.ctx.Done():
+			return
+		case <-m.stopCh:
+			return
+		}
+	}
 }
 
-func (m *mvpMembership) acceptLoop() {
+func (m *swimMembership) acceptLoop() {
+	defer m.wg.Done()
 	for m.running {
 		conn, err := m.listener.Accept()
 		if err != nil {
-			continue
+			select {
+			case <-m.stopCh:
+				return // shut down
+			default:
+			}
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				time.Sleep(time.Millisecond * 50)
+				continue
+			}
+			// Permanent error (listener closed etc): exit
+			return
 		}
 		go m.handleConn(conn)
 	}
 }
 
-func (m *mvpMembership) handleConn(conn net.Conn) {
+
+// === THE KEY: Any message from a peer always updates LastSeen, Status, etc. ===
+
+func (m *swimMembership) handleConn(conn net.Conn) {
 	defer conn.Close()
 	dec := json.NewDecoder(conn)
-	var msg wireMsg
+	var msg swimMsg
 	if err := dec.Decode(&msg); err != nil {
 		return
 	}
-	switch msg.Type {
-	case "join":
-		m.mu.Lock()
-		m.peers[msg.Peer.ID] = msg.Peer
-		peers := make([]Peer, 0, len(m.peers))
-		for _, p := range m.peers {
-			peers = append(peers, p)
-		}
-		m.mu.Unlock()
-		out := wireMsg{Type: "peers", Peer: m.self, Peers: peers}
-		enc := json.NewEncoder(conn)
-		_ = enc.Encode(&out)
-	case "peers":
-		m.mu.Lock()
-		for _, p := range msg.Peers {
-			if p.ID != m.self.ID {
-				m.peers[p.ID] = p
-			}
-		}
-		m.mu.Unlock()
-	}
-}
 
-func (m *mvpMembership) sendJoin(addr string) {
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	enc := json.NewEncoder(conn)
-	dec := json.NewDecoder(conn)
-	req := wireMsg{Type: "join", Peer: m.self}
-	if err := enc.Encode(&req); err != nil {
-		return
-	}
-	var resp wireMsg
-	if err := dec.Decode(&resp); err != nil {
-		return
-	}
 	m.mu.Lock()
-	for _, p := range resp.Peers {
-		if p.ID != m.self.ID {
-			m.peers[p.ID] = p
+	if msg.Peer.ID != m.self.ID {
+		ps, exists := m.peers[msg.Peer.ID]
+		now := time.Now()
+		if !exists {
+			m.peers[msg.Peer.ID] = &swimPeer{
+				Peer:        msg.Peer,
+				Status:      StatusAlive,
+				Incarnation: msg.Incarnation,
+				LastSeen:    now,
+			}
+			log.Printf("[membership] discovered peer: %s", msg.Peer.ID)
+		} else {
+			if msg.Incarnation > ps.Incarnation || ps.Status != StatusAlive {
+				ps.Status = StatusAlive
+				ps.Incarnation = msg.Incarnation
+				ps.SuspectAge = time.Time{}
+			}
+			ps.LastSeen = now
 		}
 	}
 	m.mu.Unlock()
+
+	switch msg.Type {
+	case "ping":
+		resp := swimMsg{Type: "ack", Peer: m.self, Incarnation: m.incarnation, Changes: m.consumeChanges()}
+		_ = json.NewEncoder(conn).Encode(&resp)
+		m.mergeChanges(msg.Changes)
+	case "ack":
+		m.mergeChanges(msg.Changes)
+	case "ping-req":
+		_ = m.handlePingReq(msg, conn)
+	case "suspect", "alive", "dead":
+		m.mergeChanges(append(msg.Changes, swimChange{
+			ID:          msg.Peer.ID,
+			Status:      msgTypeToStatus(msg.Type),
+			Incarnation: msg.Incarnation,
+		}))
+	}
 }
 
-func (m *mvpMembership) gossipLoop() {
-	t := time.NewTicker(m.cfg.GossipInterval)
-	defer t.Stop()
-	for m.running {
-		select {
-		case <-m.ctx.Done():
-			return
-		case <-t.C:
-			m.pushToAll()
+// -- Protocol --
+
+func msgTypeToStatus(t string) Status {
+	switch t {
+	case "suspect":
+		return StatusSuspect
+	case "alive":
+		return StatusAlive
+	case "dead":
+		return StatusDead
+	default:
+		return StatusUnknown
+	}
+}
+
+func (m *swimMembership) swimProtocolRound() {
+	m.cleanup()
+
+	peers := m.getPeersExceptSelf()
+	probeN := len(peers)
+	if probeN > 3 {
+		probeN = 3
+	}
+	perm := rand.Perm(len(peers))
+	for i := 0; i < probeN; i++ {
+		target := peers[perm[i]]
+		success := m.directPing(target.Peer.Addr, target.Peer.ID)
+		if !success {
+			m.indirectProbe(target.Peer.ID, probeN)
 		}
 	}
 }
 
-func (m *mvpMembership) pushToAll() {
-	m.mu.RLock()
-	peerList := make([]Peer, 0, len(m.peers))
-	for _, p := range m.peers {
-		if p.ID != m.self.ID {
-			peerList = append(peerList, p)
-		}
-	}
-	m.mu.RUnlock()
-
-	for _, p := range peerList {
-		go func(addr string) {
-			conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
-			if err != nil {
-				return
-			}
-			defer conn.Close()
-			allPeers := m.Live()
-			msg := wireMsg{Type: "peers", Peer: m.self, Peers: allPeers}
-			enc := json.NewEncoder(conn)
-			_ = enc.Encode(&msg)
-		}(p.Addr)
-	}
-}
-
-// -- API methods --
-
-func (m *mvpMembership) Self() Peer {
-	return m.self
-}
-
-func (m *mvpMembership) Live() []Peer {
+func (m *swimMembership) getPeersExceptSelf() []*swimPeer {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	out := make([]Peer, 0, len(m.peers))
-	for _, p := range m.peers {
-		out = append(out, p)
+	var out []*swimPeer
+	for id, ps := range m.peers {
+		if id != m.self.ID {
+			out = append(out, ps)
+		}
 	}
 	return out
 }
 
-func (m *mvpMembership) All() map[PeerID]Peer {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	cp := make(map[PeerID]Peer, len(m.peers))
-	for k, v := range m.peers {
-		cp[k] = v
+func (m *swimMembership) directPing(addr string, peerID PeerID) bool {
+	ch := make(chan bool, 1)
+	go func() {
+		ch <- m.sendPing(addr, nil)
+	}()
+	select {
+	case ok := <-ch:
+		return ok
+	case <-time.After(m.cfg.ProbeTimeout):
+		return false
 	}
-	return cp
 }
 
-func (m *mvpMembership) Status() map[PeerID]Status {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	s := make(map[PeerID]Status, len(m.peers))
-	for k := range m.peers {
-		s[k] = StatusAlive // MVP: always alive
+func (m *swimMembership) sendPing(addr string, relay *PeerID) bool {
+	conn, err := net.DialTimeout("tcp", addr, m.cfg.ProbeTimeout)
+	if err != nil {
+		return false
 	}
-	return s
+	defer conn.Close()
+	req := swimMsg{Type: "ping", Peer: m.self, Incarnation: m.incarnation, Changes: m.consumeChanges()}
+	if relay != nil {
+		req.Type = "ping-req"
+		req.RelayTo = *relay
+	}
+	enc := json.NewEncoder(conn)
+	if err := enc.Encode(&req); err != nil {
+		return false
+	}
+	conn.SetReadDeadline(time.Now().Add(m.cfg.ProbeTimeout))
+	var resp swimMsg
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		return false
+	}
+	m.mergeChanges(resp.Changes)
+	return resp.Type == "ack"
 }
 
-func (m *mvpMembership) GetPeer(id PeerID) (Peer, Status, bool) {
+func (m *swimMembership) indirectProbe(target PeerID, fanout int) {
+	if fanout < 2 {
+		fanout = 2
+	}
+	relays := m.pickRandomRelays(target, fanout)
+	for _, relay := range relays {
+		go func(addr string) {
+			m.sendPing(addr, &target)
+		}(relay.Peer.Addr)
+	}
+	// Suspect if no proof
+	go func() {
+		time.Sleep(m.cfg.ProbeTimeout * 2)
+		if m.suspectIfNoProof(target) {
+			log.Printf("[membership] suspect %v", target)
+			m.enqueueChange(target, StatusSuspect)
+		}
+	}()
+}
+
+func (m *swimMembership) pickRandomRelays(exclude PeerID, k int) []*swimPeer {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	p, ok := m.peers[id]
-	return p, StatusAlive, ok
+	var candidates []*swimPeer
+	for _, ps := range m.peers {
+		if ps.Peer.ID != m.self.ID && ps.Peer.ID != exclude && ps.Status == StatusAlive {
+			candidates = append(candidates, ps)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	perm := rand.Perm(len(candidates))
+	var out []*swimPeer
+	for i := 0; i < k && i < len(candidates); i++ {
+		out = append(out, candidates[perm[i]])
+	}
+	return out
 }
 
-func (m *mvpMembership) RegisterEventHandler(EventHandler)   {}
-func (m *mvpMembership) Broadcast([]byte) error             { return nil }
+func (m *swimMembership) handlePingReq(msg swimMsg, directConn net.Conn) error {
+	targetID := msg.RelayTo
+	if targetID == m.self.ID {
+		resp := swimMsg{Type: "ack", Peer: m.self, Incarnation: m.incarnation, Changes: m.consumeChanges()}
+		return json.NewEncoder(directConn).Encode(&resp)
+	}
+	m.mu.RLock()
+	ps, exists := m.peers[targetID]
+	m.mu.RUnlock()
+	if !exists {
+		return nil
+	}
+	ok := m.directPing(ps.Peer.Addr, targetID)
+	_ = ok
+	resp := swimMsg{Type: "ack", Peer: ps.Peer, Incarnation: ps.Incarnation, Changes: m.consumeChanges()}
+	return json.NewEncoder(directConn).Encode(&resp)
+}
+
+func (m *swimMembership) enqueueChange(id PeerID, status Status) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.changes = append(m.changes, swimChange{ID: id, Status: status, Incarnation: m.nextIncarnation(id, status)})
+}
+
+func (m *swimMembership) consumeChanges() []swimChange {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ch := m.changes
+	m.changes = nil
+	return ch
+}
+
+func (m *swimMembership) mergeChanges(changes []swimChange) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, c := range changes {
+		ps, exists := m.peers[c.ID]
+		now := time.Now()
+		if !exists || c.Incarnation > ps.Incarnation {
+			if ps == nil {
+				ps = &swimPeer{Peer: Peer{ID: c.ID}}
+				m.peers[c.ID] = ps
+			}
+			ps.Status = c.Status
+			ps.Incarnation = c.Incarnation
+			ps.LastSeen = now
+			if c.Status == StatusSuspect {
+				ps.SuspectAge = now
+			} else {
+				ps.SuspectAge = time.Time{}
+			}
+		}
+	}
+}
+
+func (m *swimMembership) suspectIfNoProof(id PeerID) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ps, exists := m.peers[id]
+	if !exists {
+		return false
+	}
+	if ps.Status != StatusAlive {
+		return false
+	}
+	if time.Since(ps.LastSeen) > m.cfg.ProbeTimeout*2 {
+		ps.Status = StatusSuspect
+		ps.SuspectAge = time.Now()
+		return true
+	}
+	return false
+}
+
+func (m *swimMembership) nextIncarnation(id PeerID, status Status) uint64 {
+	if id == m.self.ID && status == StatusAlive {
+		m.incarnation++
+		return m.incarnation
+	}
+	ps, exists := m.peers[id]
+	if exists {
+		return ps.Incarnation + 1
+	}
+	return 1
+}
+
+func (m *swimMembership) cleanup() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	deadTimeout := m.cfg.ProbeTimeout * time.Duration(m.cfg.ProbeRetries*2)
+	now := time.Now()
+	for id, ps := range m.peers {
+		if id == m.self.ID {
+			continue
+		}
+		if ps.Status == StatusSuspect && now.Sub(ps.SuspectAge) > deadTimeout {
+			ps.Status = StatusDead
+			ps.Incarnation++
+			ps.LastSeen = now
+			ps.SuspectAge = time.Time{}
+			log.Printf("[membership] marking DEAD after suspicion: %s", id)
+			m.enqueueChange(id, StatusDead)
+		}
+	}
+}
+
+// =============== INTERFACE ================
+func (m *swimMembership) Self() Peer {
+	return m.self
+}
+
+func (m *swimMembership) Live() []Peer {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []Peer
+	for _, ps := range m.peers {
+		if ps.Status == StatusAlive {
+			out = append(out, ps.Peer)
+		}
+	}
+	return out
+}
+
+func (m *swimMembership) GetPeer(id PeerID) (Peer, Status, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	ps, ok := m.peers[id]
+	if !ok {
+		return Peer{}, StatusUnknown, false
+	}
+	return ps.Peer, ps.Status, true
+}
+
+func (m *swimMembership) Status() map[PeerID]Status {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[PeerID]Status)
+	for id, ps := range m.peers {
+		out[id] = ps.Status
+	}
+	return out
+}
+
+func (m *swimMembership) RegisterEventHandler(handler EventHandler) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.eventHandlers = append(m.eventHandlers, handler)
+}
+
+// For now—stub, you can build cluster broadcasts out later
+func (m *swimMembership) Broadcast([]byte) error { return nil }
 
